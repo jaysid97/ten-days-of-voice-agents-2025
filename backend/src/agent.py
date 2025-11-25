@@ -1,9 +1,3 @@
-# ======================================================
-# 🧠 DAY 4: TEACH-THE-TUTOR (BIOLOGY EDITION)
-# 👨‍⚕️ Tutorial by Dr. Abhishek
-# 🚀 Features: DNA, Cells, Nucleus & Active Recall
-# ======================================================
-
 import logging
 import json
 import os
