@@ -2,261 +2,196 @@ import logging
 import json
 import os
 import asyncio
-from typing import Annotated, Literal, Optional
-from dataclasses import dataclass
-
-print("\n" + "🧬" * 50)
-print("🚀 BIOLOGY TUTOR - DAY 4 TUTORIAL")
-print("📚 SUBSCRIBE: https://www.youtube.com/@drabhishek.5460/videos")
-print("💡 agent.py LOADED SUCCESSFULLY!")
-print("🧬" * 50 + "\n")
+from datetime import datetime
+from typing import Annotated, Optional
 
 from dotenv import load_dotenv
-from pydantic import Field
 from livekit.agents import (
-    Agent,
-    AgentSession,
+    AutoSubscribe,
     JobContext,
     JobProcess,
-    RoomInputOptions,
     WorkerOptions,
     cli,
-    function_tool,
-    RunContext,
+    llm,
 )
+from livekit.agents.pipeline import VoicePipelineAgent
+from livekit.plugins import openai, deepgram, silero
 
-# 🔌 PLUGINS
-from livekit.plugins import murf, silero, google, deepgram, noise_cancellation
-from livekit.plugins.turn_detector.multilingual import MultilingualModel
+# Load environment variables
+load_dotenv(dotenv_path=".env.local")
 
-logger = logging.getLogger("agent")
-load_dotenv(".env.local")
+# Initialize Logger
+logger = logging.getLogger("jaysid-sdr")
+logger.setLevel(logging.INFO)
 
 # ======================================================
-# 📚 KNOWLEDGE BASE (BIOLOGY DATA)
+# 📂 1. KNOWLEDGE BASE & CONFIGURATION
 # ======================================================
 
-# 🆕 Renamed file so it generates fresh data for you
-CONTENT_FILE = "biology_content.json" 
+COMPANY_NAME = "Jaysid Development"
+FAQ_FILE = "jaysid_faq.json"
+LEADS_FILE = "leads_db.json"
 
-# 🧬 NEW BIOLOGY QUESTIONS
-DEFAULT_CONTENT = [
-  {
-    "id": "dna",
-    "title": "DNA",
-    "summary": "DNA (Deoxyribonucleic acid) is the molecule that carries genetic instructions for the development and functioning of all known living organisms. It is shaped like a double helix.",
-    "sample_question": "What is the full form of DNA and what is its structure called?"
-  },
-  {
-    "id": "cell",
-    "title": "The Cell",
-    "summary": "The cell is the basic structural, functional, and biological unit of all known organisms. It is often called the 'building block of life'. Organisms can be single-celled or multicellular.",
-    "sample_question": "What is the main difference between a Prokaryotic cell and a Eukaryotic cell?"
-  },
-  {
-    "id": "nucleus",
-    "title": "Nucleus",
-    "summary": "The nucleus is a membrane-bound organelle found in eukaryotic cells. It contains the cell's chromosomes (DNA) and controls the cell's growth and reproduction.",
-    "sample_question": "Why is the nucleus often referred to as the 'brain' or 'control center' of the cell?"
-  },
-  {
-    "id": "cell_cycle",
-    "title": "Cell Cycle",
-    "summary": "The cell cycle is a series of events that takes place in a cell as it grows and divides. It consists of Interphase (growth) and the Mitotic phase (division).",
-    "sample_question": "In which phase of the cell cycle does the cell spend the most time?"
-  }
+# Default Knowledge Base
+DEFAULT_FAQ = [
+    {
+        "question": "What does Jaysid Development do?",
+        "answer": "We are a premier software house specializing in Custom AI Agents, Full-Stack Web Development, and Cloud Migration services."
+    },
+    {
+        "question": "How much does a custom AI agent cost?",
+        "answer": "Our pilot packages start at $2,500 for a basic RAG chatbot. Enterprise voice agents typically range from $10k to $25k depending on integration complexity."
+    },
+    {
+        "question": "What tech stack do you use?",
+        "answer": "We specialize in Python, TypeScript, React, Next.js, and cloud providers like AWS and Google Cloud. For AI, we use OpenAI, Anthropic, and LiveKit."
+    },
+    {
+        "question": "Do you offer staff augmentation?",
+        "answer": "Yes, we can provide dedicated senior developers to join your existing team on a contract basis."
+    }
 ]
 
-def load_content():
-    """
-    📖 Checks if biology JSON exists. 
-    If NO: Generates it from DEFAULT_CONTENT.
-    If YES: Loads it.
-    """
-    try:
-        path = os.path.join(os.path.dirname(__file__), CONTENT_FILE)
-        
-        # Check if file exists
-        if not os.path.exists(path):
-            print(f"⚠️ {CONTENT_FILE} not found. Generating biology data...")
-            with open(path, "w", encoding='utf-8') as f:
-                json.dump(DEFAULT_CONTENT, f, indent=4)
-            print("✅ Biology content file created successfully.")
-            
-        # Read the file
-        with open(path, "r", encoding='utf-8') as f:
-            data = json.load(f)
-            return data
-            
-    except Exception as e:
-        print(f"⚠️ Error managing content file: {e}")
-        return []
-
-# Load data immediately on startup
-COURSE_CONTENT = load_content()
-
-# ======================================================
-# 🧠 STATE MANAGEMENT
-# ======================================================
-
-@dataclass
-class TutorState:
-    """🧠 Tracks the current learning context"""
-    current_topic_id: str | None = None
-    current_topic_data: dict | None = None
-    mode: Literal["learn", "quiz", "teach_back"] = "learn"
+def load_faq_context() -> str:
+    """Loads the FAQ and returns it as a string for the LLM system prompt."""
+    if not os.path.exists(FAQ_FILE):
+        with open(FAQ_FILE, "w") as f:
+            json.dump(DEFAULT_FAQ, f, indent=4)
     
-    def set_topic(self, topic_id: str):
-        # Find topic in loaded content
-        topic = next((item for item in COURSE_CONTENT if item["id"] == topic_id), None)
-        if topic:
-            self.current_topic_id = topic_id
-            self.current_topic_data = topic
-            return True
-        return False
-
-@dataclass
-class Userdata:
-    tutor_state: TutorState
-    agent_session: Optional[AgentSession] = None 
+    with open(FAQ_FILE, "r") as f:
+        data = json.load(f)
+        return json.dumps(data, indent=2)
 
 # ======================================================
-# 🛠️ TUTOR TOOLS
+# 💾 2. STATE MANAGEMENT & TOOLS
 # ======================================================
 
-@function_tool
-async def select_topic(
-    ctx: RunContext[Userdata], 
-    topic_id: Annotated[str, Field(description="The ID of the topic to study (e.g., 'dna', 'cell', 'nucleus')")]
-) -> str:
-    """📚 Selects a topic to study from the available list."""
-    state = ctx.userdata.tutor_state
-    success = state.set_topic(topic_id.lower())
-    
-    if success:
-        return f"Topic set to {state.current_topic_data['title']}. Ask the user if they want to 'Learn', be 'Quizzed', or 'Teach it back'."
-    else:
-        available = ", ".join([t["id"] for t in COURSE_CONTENT])
-        return f"Topic not found. Available topics are: {available}"
-
-@function_tool
-async def set_learning_mode(
-    ctx: RunContext[Userdata], 
-    mode: Annotated[str, Field(description="The mode to switch to: 'learn', 'quiz', or 'teach_back'")]
-) -> str:
-    """🔄 Switches the interaction mode and updates the agent's voice/persona."""
-    
-    # 1. Update State
-    state = ctx.userdata.tutor_state
-    state.mode = mode.lower()
-    
-    # 2. Switch Voice based on Mode
-    agent_session = ctx.userdata.agent_session 
-    
-    if agent_session:
-        if state.mode == "learn":
-            # 👨‍🏫 MATTHEW: The Lecturer
-            agent_session.tts.update_options(voice="en-US-matthew", style="Promo")
-            instruction = f"Mode: LEARN. Explain: {state.current_topic_data['summary']}"
-            
-        elif state.mode == "quiz":
-            # 👩‍🏫 ALICIA: The Examiner
-            agent_session.tts.update_options(voice="en-US-alicia", style="Conversational")
-            instruction = f"Mode: QUIZ. Ask this question: {state.current_topic_data['sample_question']}"
-            
-        elif state.mode == "teach_back":
-            # 👨‍🎓 KEN: The Student/Coach
-            agent_session.tts.update_options(voice="en-US-ken", style="Promo")
-            instruction = "Mode: TEACH_BACK. Ask the user to explain the concept to you as if YOU are the beginner."
-        else:
-            return "Invalid mode."
-    else:
-        instruction = "Voice switch failed (Session not found)."
-
-    print(f"🔄 SWITCHING MODE -> {state.mode.upper()}")
-    return f"Switched to {state.mode} mode. {instruction}"
-
-@function_tool
-async def evaluate_teaching(
-    ctx: RunContext[Userdata],
-    user_explanation: Annotated[str, Field(description="The explanation given by the user during teach-back")]
-) -> str:
-    """📝 call this when the user has finished explaining a concept in 'teach_back' mode."""
-    print(f"📝 EVALUATING EXPLANATION: {user_explanation}")
-    return "Analyze the user's explanation. Give them a score out of 10 on accuracy and clarity, and correct any mistakes."
-
-# ======================================================
-# 🧠 AGENT DEFINITION
-# ======================================================
-
-class TutorAgent(Agent):
+class LeadManager:
+    """Manages the state of the lead during the call."""
     def __init__(self):
-        # Generate list of topics for the prompt
-        topic_list = ", ".join([f"{t['id']} ({t['title']})" for t in COURSE_CONTENT])
+        self.profile = {
+            "name": None,
+            "company": None,
+            "email": None,
+            "use_case": None,
+            "budget": None,
+            "timeline": None
+        }
+
+    def update(self, **kwargs):
+        for k, v in kwargs.items():
+            if v is not None:
+                self.profile[k] = v
+        logger.info(f"📝 Profile Updated: {self.profile}")
+
+    def is_complete(self):
+        # Minimum requirements to be considered a "Lead"
+        return all([self.profile['name'], self.profile['use_case']])
+
+    def save_to_disk(self):
+        entry = self.profile.copy()
+        entry["timestamp"] = datetime.now().isoformat()
         
-        super().__init__(
-            instructions=f"""
-            You are an Biology Tutor designed to help users master concepts like DNA and Cells.
-            
-            📚 **AVAILABLE TOPICS:** {topic_list}
-            
-            🔄 **YOU HAVE 3 MODES:**
-            1. **LEARN Mode (Voice: Matthew):** You explain the concept clearly using the summary data.
-            2. **QUIZ Mode (Voice: Alicia):** You ask the user a specific question to test knowledge.
-            3. **TEACH_BACK Mode (Voice: Ken):** YOU pretend to be a student. Ask the user to explain the concept to you.
-            
-            ⚙️ **BEHAVIOR:**
-            - Start by asking what topic they want to study.
-            - Use the `set_learning_mode` tool immediately when the user asks to learn, take a quiz, or teach.
-            - In 'teach_back' mode, listen to their explanation and then use `evaluate_teaching` to give feedback.
-            """,
-            tools=[select_topic, set_learning_mode, evaluate_teaching],
+        existing_leads = []
+        if os.path.exists(LEADS_FILE):
+            try:
+                with open(LEADS_FILE, "r") as f:
+                    existing_leads = json.load(f)
+            except json.JSONDecodeError:
+                pass
+        
+        existing_leads.append(entry)
+        
+        with open(LEADS_FILE, "w") as f:
+            json.dump(existing_leads, f, indent=4)
+        logger.info(f"💾 Lead saved to {LEADS_FILE}")
+
+# Define the Global State for the specific session
+lead_state = LeadManager()
+
+# --- Tool Definitions ---
+
+class SDRTools(llm.FunctionContext):
+    
+    @llm.ai_callable(description="Update the potential client's profile with new information.")
+    def update_lead_profile(
+        self,
+        name: Annotated[Optional[str], llm.TypeInfo(description="The customer's name")] = None,
+        company: Annotated[Optional[str], llm.TypeInfo(description="The customer's company name")] = None,
+        email: Annotated[Optional[str], llm.TypeInfo(description="The customer's email address")] = None,
+        use_case: Annotated[Optional[str], llm.TypeInfo(description="What software/AI they want to build")] = None,
+        budget: Annotated[Optional[str], llm.TypeInfo(description="Their budget range")] = None,
+        timeline: Annotated[Optional[str], llm.TypeInfo(description="When they want to start")] = None,
+    ):
+        lead_state.update(
+            name=name, company=company, email=email, 
+            use_case=use_case, budget=budget, timeline=timeline
         )
+        return "Lead profile updated successfully."
+
+    @llm.ai_callable(description="Save the lead to the database when the conversation is concluding.")
+    def submit_lead(self):
+        lead_state.save_to_disk()
+        return "Lead has been saved to the database."
 
 # ======================================================
-# 🎬 ENTRYPOINT
+# 🧠 3. AGENT ENTRYPOINT
 # ======================================================
 
 def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load()
 
 async def entrypoint(ctx: JobContext):
-    ctx.log_context_fields = {"room": ctx.room.name}
-
-    print("\n" + "🧬" * 25)
-    print("🚀 STARTING BIOLOGY TUTOR SESSION")
-    print(f"📚 Loaded {len(COURSE_CONTENT)} topics from Knowledge Base")
     
-    # 1. Initialize State
-    userdata = Userdata(tutor_state=TutorState())
+    # 1. Load Knowledge Base
+    faq_data = load_faq_context()
+    
+    # 2. Define Persona & Instructions
+    system_prompt = f"""
+    You are 'Jay', the AI Sales Representative for '{COMPANY_NAME}'.
+    
+    **YOUR GOAL:**
+    Qualify inbound leads for our software development services. You need to gather information casually while answering their questions.
+    
+    **KNOWLEDGE BASE:**
+    {faq_data}
+    
+    **REQUIRED INFORMATION (Try to get these):**
+    1. Name
+    2. Company / Role
+    3. What are they trying to build? (Use Case)
+    4. Timeline/Budget
+    
+    **GUIDELINES:**
+    - Be professional, enthusiastic, and concise.
+    - Do NOT ask for all information at once. Conversation loop: Answer their question -> Ask ONE qualifying question.
+    - If you don't know an answer, say you will have a senior engineer email them.
+    - When you hear new details (like name or email), call `update_lead_profile` immediately.
+    - When the user says goodbye or the conversation ends, call `submit_lead`.
+    """
 
-    # 2. Setup Agent
-    session = AgentSession(
-        stt=deepgram.STT(model="nova-3"),
-        llm=google.LLM(model="gemini-2.5-flash"),
-        tts=murf.TTS(
-            voice="en-US-matthew", 
-            style="Promo",        
-            text_pacing=True,
-        ),
-        turn_detection=MultilingualModel(),
+    # 3. Initialize the Voice Pipeline
+    agent = VoicePipelineAgent(
         vad=ctx.proc.userdata["vad"],
-        userdata=userdata,
-    )
-    
-    # 3. Store session in userdata for tools to access
-    userdata.agent_session = session
-    
-    # 4. Start
-    await session.start(
-        agent=TutorAgent(),
-        room=ctx.room,
-        room_input_options=RoomInputOptions(
-            noise_cancellation=noise_cancellation.BVC()
+        stt=deepgram.STT(model="nova-2-general"), # Fast, accurate STT
+        llm=openai.LLM(model="gpt-4o"),           # Smartest for function calling
+        tts=openai.TTS(voice="alloy"),            # Clean, fast TTS
+        fnc_ctx=SDRTools(),                       # Bind our tools
+        chat_ctx=llm.ChatContext().append(
+            role="system",
+            text=system_prompt
         ),
     )
 
-    await ctx.connect()
+    # 4. Connect and Start
+    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+    
+    print(f"🚀 {COMPANY_NAME} Agent Started in room: {ctx.room.name}")
+    
+    # Say hello first
+    await agent.say("Hi there! Welcome to Jaysid Development. I'm Jay, the AI assistant. Are you looking to build a new software project or upgrade an existing one?", allow_interruptions=True)
+
+    agent.start(ctx.room)
 
 if __name__ == "__main__":
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
